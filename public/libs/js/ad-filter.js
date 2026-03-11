@@ -464,6 +464,9 @@
     /**
      * 拦截 HLS.js 的 loader，过滤 M3U8 响应
      */
+    // 模块级变量：存储过滤 loader 类，供外部通过 getFilteredLoaderClass() 获取
+    var _filteredLoaderClass = null;
+
     function hookHlsLoader() {
         if (typeof Hls === 'undefined') {
             log('HLS.js 未加载，延迟挂钩...');
@@ -475,18 +478,19 @@
         const OriginalLoader = Hls.DefaultConfig.loader;
 
         // 创建过滤 loader
-        class FilteredLoader extends OriginalLoader {
-            constructor(config) {
-                super(config);
-            }
+        function createFilteredLoader(BaseLoader) {
+            class FilteredLoader extends BaseLoader {
+                constructor(config) {
+                    super(config);
+                }
 
-            load(context, config, callbacks) {
-                const originalOnSuccess = callbacks.onSuccess;
+                load(context, config, callbacks) {
+                    const originalOnSuccess = callbacks.onSuccess;
 
-                callbacks.onSuccess = (response, stats, context, networkDetails) => {
-                    // 只处理 m3u8 文件（manifest 或 level）
-                    if (context.type === 'manifest' || context.type === 'level') {
+                    callbacks.onSuccess = (response, stats, context, networkDetails) => {
+                        // 处理所有 m3u8 类型的请求
                         if (typeof response.data === 'string' && response.data.includes('#EXTM3U')) {
+                            log(`🔍 拦截到 m3u8 请求, type=${context.type}, url=${(context.url || '').substring(0, 80)}...`);
                             const result = filterM3U8(response.data);
                             if (result.adsRemoved > 0) {
                                 response.data = result.filtered;
@@ -501,19 +505,24 @@
                                 }
                             }
                         }
-                    }
 
-                    originalOnSuccess(response, stats, context, networkDetails);
-                };
+                        originalOnSuccess(response, stats, context, networkDetails);
+                    };
 
-                super.load(context, config, callbacks);
+                    super.load(context, config, callbacks);
+                }
             }
+            return FilteredLoader;
         }
 
-        // 替换默认 loader
-        Hls.DefaultConfig.loader = FilteredLoader;
+        // 存储过滤 loader 类供外部使用 (customType 模式)
+        _filteredLoaderClass = createFilteredLoader(OriginalLoader);
+
+        // 同时替换默认 loader (兜底)
+        Hls.DefaultConfig.loader = _filteredLoaderClass;
 
         log('✅ HLS.js 广告过滤 loader 已安装');
+        log('📊 配置: 启用=' + AD_FILTER_CONFIG.enabled + ', DISCONTINUITY过滤=' + AD_FILTER_CONFIG.skipDiscontinuityAds);
     }
 
     /**
@@ -737,7 +746,9 @@
             AD_FILTER_CONFIG.firstSegmentSkipDuration = seconds;
         },
         // 导出 initUI 供外部调用 (如 index.html 中的设置菜单监听)
-        initUI: injectAdFilterUI
+        initUI: injectAdFilterUI,
+        // 🎯 导出过滤 loader 类供 DPlayer customType 使用
+        getFilteredLoaderClass: () => _filteredLoaderClass
     };
 
     // 初始化

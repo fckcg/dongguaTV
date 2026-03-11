@@ -966,7 +966,7 @@ app.get('/api/sites', async (req, res) => {
 
     // 回退到本地
     if (!sitesData) {
-        sitesData = JSON.parse(fs.readFileSync(DATA_FILE));
+        sitesData = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8').replace(/^\uFEFF/, ''));
     }
 
     res.json(sitesData);
@@ -1432,16 +1432,418 @@ function cleanCacheIfNeeded() {
     }, 100);
 }
 
+// ========== V2Board 机场登录集成 ==========
+
+// V2Board API 域名缓存
+let v2boardDomainsCache = null;
+let v2boardDomainsLastFetch = 0;
+const V2BOARD_DOMAINS_CACHE_TTL = 5 * 60 * 1000; // 5分钟缓存
+
+// 硬编码的备用域名列表（当 domains.json 无法访问时使用）
+const V2BOARD_FALLBACK_DOMAINS = [
+    "https://new.ednovas.org",
+    "https://cdn.nmsl.sb",
+    "https://new.nmsl.sb",
+    "https://new.ednovas.world",
+    "https://new.ednovas.blog",
+    "https://se.av.com.se",
+    "https://se.av.bingo",
+    "https://1.ednovas.org",
+    "https://cdn.ednovas.world",
+    "https://cdn.ednovas.org",
+    "https://ednovas.world",
+    "https://cdn.ednovas.me",
+    "https://ednovas.org"
+];
+
+/**
+ * 获取可用的 V2Board API 域名列表
+ * @returns {Promise<string[]>} 域名数组
+ */
+async function getV2BoardDomains() {
+    const now = Date.now();
+    if (v2boardDomainsCache && (now - v2boardDomainsLastFetch < V2BOARD_DOMAINS_CACHE_TTL)) {
+        return v2boardDomainsCache;
+    }
+
+    try {
+        const response = await axios.get('https://aaa.ednovas.xyz/domains.json', { timeout: 8000 });
+        let domains = response.data;
+        // 过滤有效的 URL
+        if (Array.isArray(domains)) {
+            domains = domains.filter(d => typeof d === 'string' && d.startsWith('https://'));
+            if (domains.length > 0) {
+                v2boardDomainsCache = domains;
+                v2boardDomainsLastFetch = now;
+                console.log(`[V2Board] 已获取 ${domains.length} 个可用域名`);
+                return domains;
+            }
+        }
+    } catch (e) {
+        console.error('[V2Board] 获取域名列表失败:', e.message, '- 使用备用域名列表');
+    }
+
+    // 返回缓存（即使过期）或硬编码的备用列表
+    return v2boardDomainsCache || V2BOARD_FALLBACK_DOMAINS;
+}
+
+/**
+ * V2Board 登录验证 API
+ * POST /api/auth/v2board
+ * Body: { email, password }
+ * 
+ * 验证逻辑:
+ * 1. 通过 v2board API 登录获取 auth token
+ * 2. 获取用户订阅信息，检查套餐有效性
+ * 3. 检查流量是否用尽
+ * 4. 处理无限时长套餐 (expired_at === 0 或 null)
+ */
+// V2Board API 请求限流 (每 IP 每分钟最多 5 次)
+const v2boardRateLimitMap = new Map();
+const V2B_RATE_LIMIT = 5;
+const V2B_RATE_WINDOW = 60 * 1000; // 1分钟
+
+// 定期清理过期限流记录 (每10分钟)
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, record] of v2boardRateLimitMap) {
+        if (now > record.resetAt) v2boardRateLimitMap.delete(ip);
+    }
+}, 10 * 60 * 1000);
+
+app.post('/api/auth/v2board', async (req, res) => {
+    const clientIP = req.ip || req.connection.remoteAddress;
+
+    // 限流检查
+    const now = Date.now();
+    const record = v2boardRateLimitMap.get(clientIP) || { count: 0, resetAt: now + V2B_RATE_WINDOW };
+    if (now > record.resetAt) {
+        record.count = 0;
+        record.resetAt = now + V2B_RATE_WINDOW;
+    }
+    record.count++;
+    v2boardRateLimitMap.set(clientIP, record);
+
+    if (record.count > V2B_RATE_LIMIT) {
+        return res.status(429).json({ success: false, message: '请求过于频繁，请1分钟后再试' });
+    }
+
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+        return res.json({ success: false, message: '请输入邮箱和密码' });
+    }
+
+    const domains = await getV2BoardDomains();
+    if (domains.length === 0) {
+        return res.json({ success: false, message: '服务暂时不可用，请稍后再试' });
+    }
+
+    let lastError = '';
+
+    // 依次尝试每个域名
+    for (const domain of domains) {
+        try {
+            // Step 1: 登录
+            const loginUrl = `${domain}/api/v1/passport/auth/login`;
+            const loginRes = await axios.post(loginUrl, { email, password }, {
+                timeout: 10000,
+                headers: { 'Content-Type': 'application/json' }
+            });
+
+            const loginData = loginRes.data;
+
+            // V2Board 返回格式: { data: { token, auth_data } } 或 { data: "token_string" }
+            if (!loginData || !loginData.data) {
+                // 密码错误：立即返回，不再尝试其他域名（避免触发 v2board 限流）
+                return res.json({ success: false, message: '邮箱或密码错误' });
+            }
+
+            // 提取 auth token
+            let authToken;
+            if (typeof loginData.data === 'string') {
+                authToken = loginData.data;
+            } else if (loginData.data.auth_data) {
+                authToken = loginData.data.auth_data;
+            } else if (loginData.data.token) {
+                authToken = loginData.data.token;
+            } else {
+                // 登录已达 v2board 服务器，但响应格式异常，不继续尝试其他域名
+                return res.json({ success: false, message: '邮箱或密码错误' });
+            }
+
+            // Step 2: 获取订阅信息
+            const subUrl = `${domain}/api/v1/user/getSubscribe`;
+            const subRes = await axios.get(subUrl, {
+                timeout: 10000,
+                headers: { 'Authorization': authToken }
+            });
+
+            const subData = subRes.data;
+
+            if (!subData || !subData.data) {
+                lastError = '无法获取订阅信息';
+                continue;
+            }
+
+            const subscription = subData.data;
+
+            // Step 3: 检查套餐有效性
+            if (!subscription.plan_id && subscription.plan_id !== 0) {
+                return res.json({ success: false, message: '您还没有订阅任何套餐，请先购买套餐' });
+            }
+
+            // Step 4: 检查过期时间
+            // expired_at === 0 或 null 表示无限时长套餐
+            const expiredAt = subscription.expired_at;
+            if (expiredAt && expiredAt > 0) {
+                // 有明确过期时间，检查是否已过期
+                const expireTimestamp = expiredAt * 1000; // V2Board 使用秒级时间戳
+                if (Date.now() > expireTimestamp) {
+                    return res.json({
+                        success: false,
+                        message: '您的套餐已过期，请续费后再使用',
+                        expired: true
+                    });
+                }
+            }
+
+            // Step 5: 检查流量是否用尽
+            // V2Board 流量字段: u (上行已用, bytes), d (下行已用, bytes), transfer_enable (总流量, bytes)
+            const usedTraffic = (subscription.u || 0) + (subscription.d || 0);
+            const totalTraffic = subscription.transfer_enable || 0;
+
+            // totalTraffic === 0 可能表示无限流量，不做限制
+            if (totalTraffic > 0 && usedTraffic >= totalTraffic) {
+                const usedGB = (usedTraffic / (1024 * 1024 * 1024)).toFixed(2);
+                const totalGB = (totalTraffic / (1024 * 1024 * 1024)).toFixed(2);
+                return res.json({
+                    success: false,
+                    message: `流量已用尽 (${usedGB}GB / ${totalGB}GB)，请购买更多流量或等待重置`,
+                    trafficExhausted: true
+                });
+            }
+
+            // Step 6: 登录成功！
+            // 生成 v2board user token (用于历史同步)
+            const v2boardUserToken = 'v2board_' + crypto.createHash('sha256').update(email.toLowerCase()).digest('hex');
+
+            // 将 v2board 用户加入同步白名单（动态）
+            if (!PASSWORD_HASH_MAP[v2boardUserToken]) {
+                PASSWORD_HASH_MAP[v2boardUserToken] = {
+                    index: -1, // v2board 用户
+                    syncEnabled: true
+                };
+            }
+
+            // 计算过期信息
+            let expiresAt = null;
+            let planType = 'limited';
+            if (!expiredAt || expiredAt === 0) {
+                planType = 'unlimited';
+            } else {
+                expiresAt = expiredAt * 1000; // 转为毫秒时间戳
+            }
+
+            // 流量信息
+            const trafficInfo = {
+                used: usedTraffic,
+                total: totalTraffic,
+                unlimited: totalTraffic === 0
+            };
+
+            // 日志：流量 + 剩余时间
+            const usedGB = (usedTraffic / (1024 * 1024 * 1024)).toFixed(2);
+            const totalGB = totalTraffic > 0 ? (totalTraffic / (1024 * 1024 * 1024)).toFixed(2) : '∞';
+            let remainingStr = '永久';
+            if (expiresAt) {
+                const remainDays = Math.ceil((expiresAt - Date.now()) / (24 * 60 * 60 * 1000));
+                remainingStr = remainDays > 0 ? `${remainDays}天` : '已过期';
+            }
+            console.log(`[V2Board] 用户 ${email} 登录成功, 套餐: ${subscription.plan?.name || subscription.plan_id}, 流量: ${usedGB}/${totalGB}GB, 剩余: ${remainingStr}`);
+
+            return res.json({
+                success: true,
+                email: email,
+                userToken: v2boardUserToken,
+                v2boardToken: authToken, // v2board auth_data token (用于免密续期)
+                plan: {
+                    id: subscription.plan_id,
+                    name: subscription.plan?.name || `套餐 #${subscription.plan_id}`,
+                    type: planType,
+                    expiresAt: expiresAt,
+                    traffic: trafficInfo
+                },
+                syncEnabled: true
+            });
+
+        } catch (err) {
+            // 区分不同错误类型
+            if (err.response) {
+                const status = err.response.status;
+                const msg = err.response.data?.message || err.response.data?.errors?.email?.[0] || '';
+
+                if (status === 500 && msg.includes('suspended')) {
+                    return res.json({ success: false, message: '您的账号已被禁用' });
+                }
+                if (status === 429) {
+                    // v2board 自身的限流（通常密码错误后触发）
+                    // 提取剩余时间，翻译为中文
+                    let waitMsg = '请求过于频繁，请稍后再试';
+                    const minuteMatch = msg.match(/(\d+)\s*(minutes?|分钟)/i);
+                    if (minuteMatch) {
+                        waitMsg = `请求过于频繁，请${minuteMatch[1]}分钟后再试`;
+                    } else if (msg.match(/(\d+)\s*(seconds?|秒)/i)) {
+                        const secMatch = msg.match(/(\d+)\s*(seconds?|秒)/i);
+                        waitMsg = `请求过于频繁，请${secMatch[1]}秒后再试`;
+                    }
+                    console.log(`[V2Board] 被面板限流: ${msg}`);
+                    return res.json({ success: false, message: waitMsg });
+                }
+                if (status === 422 || status === 403) {
+                    // 翻译常见 v2board 英文错误
+                    let translated = msg;
+                    if (msg.includes('The given data was invalid') || msg.includes('invalid')) {
+                        translated = '邮箱或密码错误';
+                    } else if (msg.includes('email')) {
+                        translated = '邮箱格式不正确';
+                    }
+                    return res.json({ success: false, message: translated });
+                }
+                // 请求已达 v2board 服务器但返回未知错误，不继续尝试其他域名（避免累加失败计数）
+                return res.json({ success: false, message: msg || `服务器错误 (${status})` });
+            } else if (err.code === 'ECONNABORTED') {
+                lastError = '连接超时';
+            } else {
+                lastError = err.message || '网络错误';
+            }
+            // 仅网络错误才继续尝试下一个域名
+            console.log(`[V2Board] 域名 ${domain} 网络不可达: ${lastError}`);
+        }
+    }
+
+    // 所有域名都失败
+    res.json({ success: false, message: lastError || '登录失败，请稍后再试' });
+});
+
+/**
+ * V2Board Token 验证 API（免密续期）
+ * POST /api/auth/v2board/check
+ * Body: { v2boardToken, email }
+ * 用 v2board auth_data token 直接查订阅状态，无需密码
+ */
+app.post('/api/auth/v2board/check', async (req, res) => {
+    const { v2boardToken, email } = req.body;
+
+    if (!v2boardToken) {
+        return res.json({ success: false, message: '缺少验证凭证' });
+    }
+
+    const domains = await getV2BoardDomains();
+    let lastError = '服务不可用';
+
+    for (const domain of domains) {
+        try {
+            // 用 token 直接获取订阅信息
+            const subUrl = `${domain}/api/v1/user/getSubscribe`;
+            const subRes = await axios.get(subUrl, {
+                timeout: 10000,
+                headers: { 'Authorization': v2boardToken }
+            });
+
+            const subData = subRes.data;
+            if (!subData || !subData.data) {
+                lastError = '获取订阅信息失败';
+                continue;
+            }
+
+            const subscription = subData.data;
+            const expiredAt = subscription.expired_at;
+
+            // 检查是否过期
+            if (expiredAt && expiredAt !== 0) {
+                const expiredMs = expiredAt * 1000;
+                if (Date.now() > expiredMs) {
+                    return res.json({
+                        success: false,
+                        message: '您的套餐已过期，请续费后再使用',
+                        expired: true
+                    });
+                }
+            }
+
+            // 检查流量
+            const usedTraffic = (subscription.u || 0) + (subscription.d || 0);
+            const totalTraffic = subscription.transfer_enable || 0;
+            if (totalTraffic > 0 && usedTraffic >= totalTraffic) {
+                const usedGB = (usedTraffic / (1024 * 1024 * 1024)).toFixed(2);
+                const totalGB = (totalTraffic / (1024 * 1024 * 1024)).toFixed(2);
+                return res.json({
+                    success: false,
+                    message: `流量已用尽 (${usedGB}GB / ${totalGB}GB)`,
+                    trafficExhausted: true
+                });
+            }
+
+            // 计算信息
+            let expiresAt = null;
+            let planType = 'limited';
+            if (!expiredAt || expiredAt === 0) {
+                planType = 'unlimited';
+            } else {
+                expiresAt = expiredAt * 1000;
+            }
+
+            // 生成 userToken
+            const v2boardUserToken = 'v2board_' + crypto.createHash('sha256').update((email || '').toLowerCase()).digest('hex');
+            if (!PASSWORD_HASH_MAP[v2boardUserToken]) {
+                PASSWORD_HASH_MAP[v2boardUserToken] = { index: -1, syncEnabled: true };
+            }
+
+            console.log(`[V2Board] Token 验证成功: ${email || '未知用户'}`);
+
+            return res.json({
+                success: true,
+                userToken: v2boardUserToken,
+                plan: {
+                    id: subscription.plan_id,
+                    name: subscription.plan?.name || `套餐 #${subscription.plan_id}`,
+                    type: planType,
+                    expiresAt: expiresAt,
+                    traffic: {
+                        used: usedTraffic,
+                        total: totalTraffic,
+                        unlimited: totalTraffic === 0
+                    }
+                }
+            });
+
+        } catch (err) {
+            if (err.response && err.response.status === 403) {
+                // Token 过期/无效
+                return res.json({ success: false, message: 'Token 已过期，请重新登录', tokenExpired: true });
+            }
+            lastError = err.message || '网络错误';
+            console.log(`[V2Board] Token 验证域名 ${domain} 失败: ${lastError}`);
+        }
+    }
+
+    res.json({ success: false, message: lastError });
+});
+
+// ========== 认证 API ==========
+
 // 5. 认证检查 API
 app.get('/api/auth/check', (req, res) => {
     // 检查是否需要密码
     res.json({
         requirePassword: ACCESS_PASSWORDS.length > 0,
-        multiUserMode: ACCESS_PASSWORDS.length > 1
+        multiUserMode: ACCESS_PASSWORDS.length > 1,
+        v2boardEnabled: true  // 支持 v2board 机场登录
     });
 });
 
-// 6. 验证密码 API（支持多密码）
+// 6. 验证密码 API（支持多密码 + v2board token）
 app.post('/api/auth/verify', (req, res) => {
     const { password, passwordHash } = req.body;
 
@@ -1460,7 +1862,7 @@ app.post('/api/auth/verify', (req, res) => {
         return res.json({ success: false });
     }
 
-    // 检查是否匹配任一密码
+    // 检查是否匹配任一密码（包括 v2board 动态注册的 token）
     const userInfo = PASSWORD_HASH_MAP[inputHash];
     if (userInfo !== undefined) {
         // 密码有效
