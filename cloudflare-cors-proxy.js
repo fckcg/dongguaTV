@@ -155,6 +155,7 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
             const rewrittenContent = rewriteM3u8(m3u8Content, targetURL, currentOrigin);
 
             responseHeaders.set('Content-Type', 'application/vnd.apple.mpegurl');
+            responseHeaders.set('Cache-Control', 'no-cache, no-store, must-revalidate');
             responseHeaders.delete('Content-Length'); // 长度已变化
 
             return new Response(rewrittenContent, {
@@ -162,6 +163,11 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
                 statusText: response.statusText,
                 headers: responseHeaders
             });
+        }
+
+        // 非 m3u8 响应也禁止缓存错误状态码（防止 403 被浏览器缓存）
+        if (!response.ok) {
+            responseHeaders.set('Cache-Control', 'no-cache, no-store, must-revalidate');
         }
 
         return new Response(response.body, {
